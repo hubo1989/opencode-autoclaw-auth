@@ -44,17 +44,21 @@ OpenCode 同样可加载（`opencode auth login`）。登录信息保存在 magp
 
 ## 每日签到
 
-`magpie quota` 的额度窗口里会显示**每日签到**状态（今日已签 ✓ / 今日未签 +N）。**自动签到默认开启**：每次查额度（`magpie quota`、GUI 刷新）发现未签就自动补签（服务端幂等，本地按天去重、失败按小时重试）；token 刷新链路上也会补签。
+两种方式，推荐用**原生签到**：
 
-> **GUI 显示样式说明**：magpie 桌面端的原生签到卡片（绿点「今日已签到 +N · 连续 N 天」+「自动签到」开关按钮）是宿主 App 内置的，只覆盖 WorkBuddy / Qoder / Trae / MiniMax 等少数供应商。本插件不在内置名单里，签到状态以额度窗口行的形式展示（`每日签到：今日已签 ✓ · 自动签到开`），开关走下述 options/配置文件通道，功能等价。
+**① magpie 原生签到（magpie ≥ v0.1.1083，推荐）**：插件实现 `auth.checkin` 钩子，走 magpie 统一调度——Settings → Usage → Plugins 里每个供应商有 **Daily check-in** 开关（默认关），打开后每天每账号自动签一次（北京时间；启动 2 分钟后首查、每 30 分钟轮询，失败 30 分钟后重试），账户 Usage 卡片显示绿点签到结果（`+N · 连续 N 天`），也可 **Check in now** 手动签。与 WorkBuddy / Qoder 等内置签到是同一套 UI。
 
-开关有**两个通道**（插件 options 优先，配置文件兜底——GUI 插件页没有选项入口时用文件）：
+**② 旧链路自动补签（默认关）**：查额度（`magpie quota`、GUI 刷新）与 token 刷新时发现未签就补签（服务端幂等，本地按天去重、失败按小时重试）。旧版 magpie / OpenCode 宿主或偏好该行为的用户开启 `signinOnUsage`。
+
+`magpie quota` 的额度窗口里始终显示**每日签到**状态行（今日已签 ✓ / 今日未签 +N）。
+
+旧链路的开关有**两个通道**（插件 options 优先，配置文件兜底——GUI 插件页没有选项入口时用文件；原生签到开关只在 GUI 的 Settings 里，不走这两个通道）：
 
 ```sh
 # 通道 1：插件 options（magpie CLI）
-magpie plugin options opencode-autoclaw-auth '{"signin": false}'     # 关闭自动签到
-magpie plugin options opencode-autoclaw-auth '{"signinHour": 8}'     # 只在每天 8 点补签
-magpie plugin options opencode-autoclaw-auth '{"signinOnUsage": false}' # 查额度时不补签（默认 true）
+magpie plugin options opencode-autoclaw-auth '{"signin": false}'        # 关闭自动补签总开关
+magpie plugin options opencode-autoclaw-auth '{"signinHour": 8}'        # 只在 8:00–8:59 补签
+magpie plugin options opencode-autoclaw-auth '{"signinOnUsage": true}'  # 开启查额度/刷新自动补签（旧版默认行为）
 
 # 通道 2：配置文件 ~/.config/magpie/autoclaw.json（保存即生效，热读取）
 cat > ~/.config/magpie/autoclaw.json <<'EOF'
@@ -64,8 +68,8 @@ EOF
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `signin` | `true` | 总开关 |
-| `signinOnUsage` | `true` | 查额度时自动补签（最主要的触发链路） |
+| `signin` | `true` | 旧链路自动补签总开关（不影响原生 checkin） |
+| `signinOnUsage` | `false` | 查额度/刷新时自动补签（v0.2.0 起默认关，交给原生开关） |
 | `signinHour` | `null` | 限定补签小时：`8` = 仅当本地时间处于 8:00–8:59 时补签（错过该时段当天不签）；`null` 不限 |
 
 ## 已知行为

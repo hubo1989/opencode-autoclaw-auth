@@ -207,22 +207,52 @@ async function dailySignin(accessToken, host) {
   }
 }
 
-/** 查询 daily_signin 任务状态。 */
+/** 查任务列表；401/403 throw（登录失效），HTTP 其他失败/非 envelope 返回 null，网络错误 throw。 */
+async function taskList(accessToken, host) {
+  const res = await fetch(`${host}/autoclaw-proxy/proxy/autoclaw-task-list`, {
+    method: "GET",
+    headers: bizHeaders(accessToken),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (res.status === 401 || res.status === 403) {
+    throw new Error(`登录已失效（HTTP ${res.status}）`);
+  }
+  if (!res.ok) return null;
+  const env = await res.json().catch(() => null);
+  return Array.isArray(env?.data) ? env.data : null;
+}
+
+/** 查询 daily_signin 任务状态（容错版：任何失败返回 null）。 */
 async function signinStatus(accessToken, host) {
   try {
-    const res = await fetch(`${host}/autoclaw-proxy/proxy/autoclaw-task-list`, {
-      method: "GET",
-      headers: bizHeaders(accessToken),
-      signal: AbortSignal.timeout(15_000),
-    });
-    if (!res.ok) return null;
-    const env = await res.json().catch(() => null);
-    const tasks = Array.isArray(env?.data) ? env.data : [];
+    const tasks = await taskList(accessToken, host);
+    if (!tasks) return null;
     const t = tasks.find((x) => x?.task_id === "daily_signin");
     return t ? { status: String(t.status ?? ""), desc: String(t.status_description ?? ""), reward: Number(t.reward_points ?? 0) } : null;
   } catch {
     return null;
   }
+}
+
+/** 可选数字：>0 才返回，否则 undefined（checkin 的 credit/streak 允许缺省）。 */
+function optNumber(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+/** dailySignin 结果 → magpie 原生 checkin outcome（{outcome, credit?, streak?, message?}）。 */
+function checkinOutcome(r) {
+  if (!r) return { outcome: "failed", message: "签到接口无响应" };
+  if (r.success) {
+    return {
+      outcome: "claimed",
+      credit: optNumber(r.reward_points),
+      streak: optNumber(r.continuous_days),
+      message: `已签到${r.reward_points ? ` +${r.reward_points}` : ""}${r.continuous_days ? ` · 连续 ${r.continuous_days} 天` : ""}`,
+    };
+  }
+  if (r.already_completed) return { outcome: "done", credit: optNumber(r.reward_points) };
+  return { outcome: "failed", message: String(r.message ?? r.msg ?? "签到失败") };
 }
 
 /** 本地去重键（成功才记；按小时允许重试）。 */
@@ -231,8 +261,9 @@ const signinTriedLocal = new Map(); // key → hour-stamp of last SUCCESSFUL sig
 /**
  * 签到配置合并：插件 options（plugins.json 的 options 字段）优先，
  * 其次配置文件 ~/.config/magpie/autoclaw.json（热读取，GUI 没有选项入口时的保底通道）：
- *   { "signin": true, "signinHour": null, "signinOnUsage": true }
- * 两处都没有 → 默认全开（signin=true, signinOnUsage=true）。
+ *   { "signin": true, "signinHour": null, "signinOnUsage": false }
+ * 两处都没有 → signin=true、signinOnUsage=false（自动补签默认关：
+ * 签到交给 magpie 原生 checkin 开关；旧版宿主/需要旧行为时显式开 signinOnUsage）。
  */
 function signinConfig(options) {
   let fileCfg = {};
@@ -245,17 +276,17 @@ function signinConfig(options) {
   } catch { /* 无文件/解析失败 → 用默认 */ }
   const merged = { ...fileCfg, ...(options ?? {}) };
   return {
-    signin: merged.signin !== false,            // 默认开
-    signinOnUsage: merged.signinOnUsage !== false, // 默认开（查额度即补签——这是最主要的触发链路）
+    signin: merged.signin !== false,               // 自动补签总开关（默认开）
+    signinOnUsage: merged.signinOnUsage === true,  // usage/refresh 链路自动补签（默认关，见上）
     signinHour: typeof merged.signinHour === "number" ? merged.signinHour : null,
   };
 }
 
-/** 依据合并配置决定是否补签。reason: 'refresh' | 'usage' */
+/** 依据合并配置决定是否补签（usage/refresh 旧链路；原生 checkin 不经过这里）。 */
 async function maybeSignin(accessToken, host, options, reason, accountKey) {
+  void reason;
   const cfg = signinConfig(options);
-  if (!cfg.signin) return;
-  if (reason === "usage" && !cfg.signinOnUsage) return;
+  if (!cfg.signin || !cfg.signinOnUsage) return;
   if (cfg.signinHour !== null && new Date().getHours() !== cfg.signinHour) return;
   const hourStamp = `${new Date().toISOString().slice(0, 13)}`; // YYYY-MM-DDTHH（每小时可重试一次）
   const dayKey = `${accountKey ?? "x"}`;
@@ -426,7 +457,7 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
             fetchWallets(token, hosts),
             signinStatus(token, hosts[0]).then((s) => s ?? signinStatus(token, hosts[1] ?? hosts[0])),
           ]);
-          // 自动补签（默认开）：查额度即触发——这是最主要的签到链路（refresh 一天几乎只跑一次）。
+          // 旧链路自动补签（默认关，需 signinOnUsage=true）：查额度即触发。
           // 放在状态查询之后：未签才补，补完重查一次状态展示。
           if (signin && signin.status !== "completed" && (cfg.signin && cfg.signinOnUsage)) {
             await maybeSignin(token, hosts[0], options, "usage", providerId);
@@ -445,17 +476,14 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
             .filter((w) => Math.round(w.balance) !== Math.round(total))
             .slice(0, 3);
 
-          // 签到窗口行 = 状态 + 自动签到开关状态（quota 界面即开关指示：改配置后下次刷新可见）
-          const cfgTag = cfg.signin
-            ? (cfg.signinHour !== null ? ` · 自动签 ${cfg.signinHour}点` : " · 自动签到开")
-            : " · 自动签到关";
+          // 签到窗口行 = 状态展示（开关指示交给 magpie 原生 checkin 的 Settings 开关）
           const signinWindow = signinFinal
             ? [{
                 name: "每日签到",
                 used: signinFinal.status === "completed" ? 0 : 1,
                 display: signinFinal.status === "completed"
-                  ? `今日已签 ✓${signinFinal.reward ? ` +${signinFinal.reward}` : ""}${cfgTag}`
-                  : `今日未签（+${signinFinal.reward || 400}）${cfgTag}`,
+                  ? `今日已签 ✓${signinFinal.reward ? ` +${signinFinal.reward}` : ""}`
+                  : `今日未签（+${signinFinal.reward || 400}）`,
                 aside: true,
               }]
             : [];
@@ -471,6 +499,41 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
         } catch (e) {
           return { error: `积分查询失败: ${e?.message ?? e}`, windows: [] };
         }
+      },
+
+      /**
+       * 原生每日签到钩子（magpie ≥ v0.1.1083）。由宿主调度：Settings → Usage → Plugins
+       * 的 Daily check-in 开关（默认关）控制；每天每账号一次，结果上 Usage 卡片。
+       * 契约：返回 {outcome, credit?, streak?, message?}；throw → failed（30 分钟后重试）。
+       */
+      async checkin(getAuth) {
+        const auth = await getAuth();
+        if (auth?.type !== "oauth" || !auth.access) throw new Error("未登录");
+        const token = bareToken(auth.access);
+        const hosts = providerId === "autoclaw-cn" ? [CN_HOST, GLOBAL_HOST] : [GLOBAL_HOST, CN_HOST];
+
+        // 先查任务状态：区分「无签到活动」（inactive）与「查询失败」（throw → failed 重试）
+        let task = null;
+        let lastErr = null;
+        for (const h of hosts) {
+          try {
+            const tasks = await taskList(token, h);
+            if (tasks) {
+              task = tasks.find((x) => x?.task_id === "daily_signin") ?? null;
+              break;
+            }
+          } catch (e) { lastErr = e; }
+        }
+        if (!task && lastErr) throw lastErr;
+        if (!task) return { outcome: "inactive", message: "当前没有签到活动" };
+        if (String(task.status ?? "") === "completed") {
+          return { outcome: "done", credit: optNumber(task.reward_points) };
+        }
+
+        // 补签：主 host 优先，无响应再试备用 host（服务端幂等）
+        const r = await dailySignin(token, hosts[0]).catch(() => null)
+          ?? await dailySignin(token, hosts[1] ?? hosts[0]).catch(() => null);
+        return checkinOutcome(r);
       },
     },
 
@@ -911,7 +974,7 @@ export const AutoclawCnAuthPlugin = makeAutoclawPlugin({
 /** 测试辅助（magpie/OpenCode 不会把它当插件调用）。 */
 export const _internal = {
   md5Hex, jwtClaim, tokenFields, codeValue, bizHeaders, bareToken, newDeviceId,
-  dailySignin, signinStatus, maybeSignin, signinConfig, refreshTokens,
+  dailySignin, signinStatus, maybeSignin, signinConfig, checkinOutcome, refreshTokens,
   fetchUserProfile, accountDisplayName,
   guidePageHtml, callbackPageHtml,
 };
