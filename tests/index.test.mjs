@@ -8,7 +8,7 @@ import { _internal, AutoclawAuthPlugin, AutoclawCnAuthPlugin } from "../index.mj
 
 const {
   md5Hex, jwtClaim, tokenFields, codeValue, bizHeaders, bareToken,
-  newDeviceId, signinConfig, accountDisplayName,
+  newDeviceId, signinConfig, checkinOutcome, accountDisplayName,
 } = _internal;
 
 const b64url = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url");
@@ -85,34 +85,57 @@ test("bizHeaders：签名头齐全，Authorization 按需", () => {
 
 // ---- 签到配置 ----------------------------------------------------------------
 
-test("signinConfig：无文件无 options → 默认全开", () => {
+test("signinConfig：无文件无 options → 默认（自动补签关，交给原生 checkin）", () => {
   const tmp = mkdtempSync(join(tmpdir(), "autoclaw-test-"));
   const prev = process.env.XDG_CONFIG_HOME;
   try {
     process.env.XDG_CONFIG_HOME = tmp;
-    assert.deepEqual(signinConfig(undefined), { signin: true, signinOnUsage: true, signinHour: null });
-    assert.deepEqual(signinConfig({}), { signin: true, signinOnUsage: true, signinHour: null });
+    assert.deepEqual(signinConfig(undefined), { signin: true, signinOnUsage: false, signinHour: null });
+    assert.deepEqual(signinConfig({}), { signin: true, signinOnUsage: false, signinHour: null });
 
     // 配置文件通道（热读取）
     mkdirSync(join(tmp, "magpie"), { recursive: true });
     const file = join(tmp, "magpie", "autoclaw.json");
     writeFileSync(file, JSON.stringify({ signin: false, signinHour: 8 }));
-    assert.deepEqual(signinConfig(undefined), { signin: false, signinOnUsage: true, signinHour: 8 });
+    assert.deepEqual(signinConfig(undefined), { signin: false, signinOnUsage: false, signinHour: 8 });
+    writeFileSync(file, JSON.stringify({ signinOnUsage: true }));
+    assert.deepEqual(signinConfig(undefined), { signin: true, signinOnUsage: true, signinHour: null });
 
     // 插件 options 优先于文件（options 未给的字段沿用文件值）
-    assert.deepEqual(signinConfig({ signin: true }), { signin: true, signinOnUsage: true, signinHour: 8 });
-    assert.deepEqual(signinConfig({ signinHour: null }), { signin: false, signinOnUsage: true, signinHour: null });
+    writeFileSync(file, JSON.stringify({ signin: false, signinHour: 8 }));
+    assert.deepEqual(signinConfig({ signin: true, signinOnUsage: true }), { signin: true, signinOnUsage: true, signinHour: 8 });
+    assert.deepEqual(signinConfig({ signinHour: null }), { signin: false, signinOnUsage: false, signinHour: null });
 
     // 非法 signinHour 归 null；解析失败的文件当不存在
     writeFileSync(file, JSON.stringify({ signinHour: "8" }));
     assert.equal(signinConfig(undefined).signinHour, null);
     writeFileSync(file, "{ not json");
-    assert.deepEqual(signinConfig(undefined), { signin: true, signinOnUsage: true, signinHour: null });
+    assert.deepEqual(signinConfig(undefined), { signin: true, signinOnUsage: false, signinHour: null });
   } finally {
     if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = prev;
     rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+// ---- 原生 checkin 结果映射 -----------------------------------------------------
+
+test("checkinOutcome：dailySignin 结果 → magpie checkin 契约", () => {
+  assert.deepEqual(
+    checkinOutcome({ success: true, reward_points: 400, continuous_days: 7 }),
+    { outcome: "claimed", credit: 400, streak: 7, message: "已签到 +400 · 连续 7 天" },
+  );
+  assert.deepEqual(
+    checkinOutcome({ success: true, reward_points: 0 }),
+    { outcome: "claimed", credit: undefined, streak: undefined, message: "已签到" },
+  );
+  assert.deepEqual(
+    checkinOutcome({ already_completed: true, reward_points: 200 }),
+    { outcome: "done", credit: 200 },
+  );
+  assert.deepEqual(checkinOutcome(null), { outcome: "failed", message: "签到接口无响应" });
+  assert.deepEqual(checkinOutcome({ success: false, message: "风控拦截" }), { outcome: "failed", message: "风控拦截" });
+  assert.deepEqual(checkinOutcome({ success: false }), { outcome: "failed", message: "签到失败" });
 });
 
 // ---- GUI 显示名 ----------------------------------------------------------------
@@ -136,6 +159,7 @@ test("插件工厂：config() 注册供应商/模型，auth/provider 钩子齐�
   assert.ok(cfg.provider.autoclaw.models.zai_auto);
   assert.equal(plugin.auth.provider, "autoclaw");
   assert.ok(plugin.auth.refresh && plugin.auth.loader && plugin.auth.usage);
+  assert.equal(typeof plugin.auth.checkin, "function"); // 原生签到钩子存在
   assert.ok(plugin.auth.methods[0].prompts.length > 0); // OAuth 引导页选项存在
   assert.equal(plugin.provider.id, "autoclaw");
 

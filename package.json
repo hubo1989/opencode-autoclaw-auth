@@ -1,6 +1,6 @@
 {
   "name": "opencode-autoclaw-auth",
-  "version": "0.1.11",
+  "version": "0.2.0",
   "description": "OpenCode/magpie provider plugin: AutoClaw (Zhipu OpenClaw) — phone-SMS and oversea web OAuth, multi-account pool, credit balance, daily check-in",
   "type": "module",
   "main": "./index.mjs",
@@ -37,7 +37,7 @@
     "options": {
       "signin": true,
       "signinHour": null,
-      "signinOnUsage": true
+      "signinOnUsage": false
     }
   }
 }
